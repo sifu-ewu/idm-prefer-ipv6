@@ -22,6 +22,9 @@ hosts that have nothing else.
 adapter at it, keeping your normal DNS servers as fallbacks so name resolution
 keeps working even if the filter is stopped.
 
+While the PC has no IPv6 route (for example on a network without IPv6), the
+filter passes `A` answers through unchanged, so dual-stack hosts stay reachable.
+
 ## Requirements
 
 - Windows 10 or 11
@@ -29,6 +32,15 @@ keeps working even if the filter is stopped.
 - The `dnspython` package (installed automatically on first `on`)
 
 ## Usage
+
+Windows blocks `.ps1` scripts by default. Allow local scripts once:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+If you downloaded the ZIP instead of cloning, also run `Get-ChildItem | Unblock-File`
+in the folder.
 
 ```powershell
 git clone https://github.com/sifu-ewu/idm-prefer-ipv6.git
@@ -43,6 +55,8 @@ cd idm-prefer-ipv6
 Restart IDM after turning the filter on or off so it re-resolves hosts.
 
 If your adapter is not called `Ethernet`, pass it: `.\idm-ipv6.ps1 on -Adapter "Wi-Fi"`.
+`Get-NetAdapter` lists the names. The adapter is remembered, so later `off` and
+`status` act on the same one.
 
 On first `on` the script writes `config.json` with the DNS servers your adapter
 uses at that moment plus Cloudflare as a last resort. Edit it if you want
@@ -77,8 +91,16 @@ hosts file. The address is fixed when you run it, so re-run if the host moves.
 - The filter affects every program on the PC, not only IDM. Browsers already
   prefer IPv6, so in practice nothing changes for them.
 - A host that advertises IPv6 but whose IPv6 side is broken will fail instead of
-  falling back to IPv4, because Windows never sees the IPv4 address. Run
+  falling back to IPv4, because Windows never sees the IPv4 address. The same
+  happens if your IPv6 is broken while the PC still has an IPv6 route. Run
   `.\idm-ipv6.ps1 off` and it is back to normal.
+- `off` resets the adapter to DHCP DNS. If you had DNS servers set by hand,
+  enter them again afterwards.
+- Only one adapter is repointed. If another one is connected too (Wi-Fi and
+  Ethernet together, or a VPN), Windows can resolve through that adapter's DNS
+  and IDM gets IPv4 again.
+- If the filter is slow to answer, Windows asks the fallback DNS servers directly
+  and can stick with them for a while. `status` shows when that happens.
 - The download server is often a different hostname from the website. A site
   can be reachable over IPv6 while its file servers are IPv4 only. Check with
   `Resolve-DnsName <download-host> -Type AAAA`.
