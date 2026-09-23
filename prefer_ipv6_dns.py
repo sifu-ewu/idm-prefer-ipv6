@@ -9,10 +9,14 @@ IPv6 whenever a host has it:
                        no AAAA      -> forward the A query unchanged
   * everything else -> forwarded unchanged
 
-Config lives in config.json next to this file (written by install.ps1).
+A queries are passed through untouched while this PC has no IPv6 route
+(e.g. on a network without IPv6), so dual-stack hosts stay reachable.
+
+Config lives in config.json next to this file (written by idm-ipv6.ps1).
 Run with --verbose to log every filtered name.
 """
 import argparse
+import ipaddress
 import json
 import logging
 import logging.handlers
@@ -25,17 +29,29 @@ from pathlib import Path
 
 import dns.flags
 import dns.message
+import dns.rcode
 import dns.rdatatype
 
 HERE = Path(__file__).resolve().parent
-CONFIG = json.loads((HERE / "config.json").read_text())
 
-LISTEN = CONFIG.get("listen", ["127.0.0.1", "::1"])
-PORT = int(CONFIG.get("port", 53))
-UPSTREAMS = CONFIG["upstreams"]          # list of IP strings, tried in order
-TIMEOUT = float(CONFIG.get("timeout", 2.0))
+# Set from config.json by load_config().
+LISTEN = ["127.0.0.1", "::1"]
+PORT = 53
+UPSTREAMS = []                           # list of IP strings, tried in order
+TIMEOUT = 2.0
+
+V6_ROUTE_PROBE = "2606:4700:4700::1111"  # any global IPv6 address; nothing is sent to it
 
 log = logging.getLogger("prefer-ipv6-dns")
+
+
+def load_config():
+    global LISTEN, PORT, UPSTREAMS, TIMEOUT
+    config = json.loads((HERE / "config.json").read_text())
+    LISTEN = config.get("listen", LISTEN)
+    PORT = int(config.get("port", PORT))
+    UPSTREAMS = config["upstreams"]
+    TIMEOUT = float(config.get("timeout", TIMEOUT))
 
 
 # ----------------------------------------------------------------- upstream --
@@ -52,7 +68,8 @@ def forward_udp(wire):
         try:
             with socket.socket(fam, socket.SOCK_DGRAM) as s:
                 s.settimeout(TIMEOUT)
-                s.sendto(wire, addr)
+                s.connect(addr)                  # only accept replies from this upstream
+                s.send(wire)
                 return s.recv(65535)
         except OSError as e:
             log.debug("upstream %s failed: %s", ip, e)
@@ -94,6 +111,21 @@ def forward(wire, via_tcp):
 
 # ------------------------------------------------------------------- filter --
 
+def have_ipv6_route():
+    """True if this PC can reach the IPv6 internet at all.
+
+    connect() on a UDP socket only does a route lookup, so this is cheap enough
+    to run per query and follows the PC between networks.
+    """
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as s:
+            s.connect((V6_ROUTE_PROBE, 53))
+            src = s.getsockname()[0].split("%")[0]
+    except OSError:
+        return False
+    return not ipaddress.ip_address(src).is_link_local
+
+
 def has_ipv6(name):
     q = dns.message.make_query(name, dns.rdatatype.AAAA)
     try:
@@ -113,7 +145,9 @@ def resolve(wire, via_tcp):
 
     if len(query.question) == 1 and query.question[0].rdtype == dns.rdatatype.A:
         name = query.question[0].name
-        if has_ipv6(name):
+        if not have_ipv6_route():
+            log.info("passed A for %s (no IPv6 route)", name.to_text(omit_final_dot=True))
+        elif has_ipv6(name):
             log.info("filtered A for %s (has AAAA)", name.to_text(omit_final_dot=True))
             resp = dns.message.make_response(query)
             resp.flags |= dns.flags.RA
@@ -150,7 +184,9 @@ def make_server(cls, handler, addr):
 
     class Srv(cls):
         address_family = fam
-        allow_reuse_address = True
+        # On Windows SO_REUSEADDR lets a second process bind the same port and
+        # silently share its queries, so only use it elsewhere.
+        allow_reuse_address = sys.platform != "win32"
         daemon_threads = True
 
     return Srv((addr, PORT), handler)
@@ -169,13 +205,19 @@ def main():
     if sys.stderr:                               # absent under pythonw
         log.addHandler(logging.StreamHandler(sys.stderr))
 
+    # pythonw has no console, so a startup error is only visible in the log.
     servers = []
-    for addr in LISTEN:
-        for cls, h in ((socketserver.ThreadingUDPServer, UDPHandler),
-                       (socketserver.ThreadingTCPServer, TCPHandler)):
-            srv = make_server(cls, h, addr)
-            threading.Thread(target=srv.serve_forever, daemon=True).start()
-            servers.append(srv)
+    try:
+        load_config()
+        for addr in LISTEN:
+            for cls, h in ((socketserver.ThreadingUDPServer, UDPHandler),
+                           (socketserver.ThreadingTCPServer, TCPHandler)):
+                srv = make_server(cls, h, addr)
+                threading.Thread(target=srv.serve_forever, daemon=True).start()
+                servers.append(srv)
+    except Exception:                            # noqa: BLE001
+        log.exception("could not start")
+        sys.exit(1)
 
     log.warning("listening on %s port %d, upstreams %s", LISTEN, PORT, UPSTREAMS)
     try:
