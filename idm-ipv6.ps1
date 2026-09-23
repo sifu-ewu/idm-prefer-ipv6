@@ -11,8 +11,11 @@
   status  show whether it is running and whether IPv4 is being filtered.
   remove  same as off, plus deletes the logon task.
 
+  -Adapter defaults to the adapter the last "on" used, else "Ethernet".
+
 .EXAMPLE
   .\idm-ipv6.ps1 on
+  .\idm-ipv6.ps1 on -Adapter "Wi-Fi"
   .\idm-ipv6.ps1 off
   .\idm-ipv6.ps1 status
 #>
@@ -21,7 +24,8 @@ param(
     [Parameter(Position = 0)]
     [ValidateSet('on', 'off', 'status', 'remove')]
     [string] $Action = 'status',
-    [string] $Adapter = 'Ethernet'
+    [string] $Adapter,
+    [switch] $Elevated                   # internal: set on the UAC re-launch
 )
 
 $ErrorActionPreference = 'Stop'
@@ -29,7 +33,12 @@ $Here     = Split-Path -Parent $PSCommandPath
 $TaskName = 'PreferIPv6DNS'
 $Script   = Join-Path $Here 'prefer_ipv6_dns.py'
 $Config   = Join-Path $Here 'config.json'
+$State    = Join-Path $Here 'adapter.txt'   # adapter the last "on" repointed, so "off" undoes that one
 $TestHost = 'speed.cloudflare.com'   # dual-stack host used for the live check
+
+if (-not $Adapter) {
+    $Adapter = if (Test-Path $State) { (Get-Content $State -Raw).Trim() } else { 'Ethernet' }
+}
 
 function Test-Admin {
     ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
@@ -74,42 +83,57 @@ if ($Action -eq 'status') { Show-Status; return }
 # Adapter DNS changes need admin: re-run this script elevated, then show status here.
 if (-not (Test-Admin)) {
     Start-Process powershell -Verb RunAs -Wait -ArgumentList @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", $Action, '-Adapter', $Adapter)
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", $Action,
+        '-Adapter', "`"$Adapter`"", '-Elevated')
     Start-Sleep -Seconds 1
     Show-Status
     return
 }
 
 # ------------------------------------------------------------------ elevated --
-switch ($Action) {
-    'on' {
-        Initialize-Config
-        python -m pip install --user --quiet -r (Join-Path $Here 'requirements.txt')
-        $pythonw  = (Get-Command pythonw).Source
-        $act      = New-ScheduledTaskAction -Execute $pythonw -Argument "`"$Script`"" -WorkingDirectory $Here
-        $trig     = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-        $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -RestartCount 3 `
-                        -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew -Hidden
-        Register-ScheduledTask -TaskName $TaskName -Action $act -Trigger $trig -Settings $settings `
-            -User $env:USERNAME -Force | Out-Null
-        Enable-ScheduledTask -TaskName $TaskName | Out-Null
-        if (-not (Get-FilterProcess)) { Start-ScheduledTask -TaskName $TaskName; Start-Sleep -Seconds 2 }
-        if (-not (Get-FilterProcess)) { throw "filter did not start - see $Here\prefer_ipv6_dns.log" }
+try {
+    switch ($Action) {
+        'on' {
+            Initialize-Config
+            $python   = & python -c "import sys; print(sys.executable)"
+            if (-not $python) { throw "python not found on PATH - install Python 3.10+ from python.org" }
+            & $python -m pip install --user --quiet -r (Join-Path $Here 'requirements.txt')
+            & $python -c "import dns.message"
+            if ($LASTEXITCODE) { throw "dnspython is not installed for $python" }
+            # pythonw next to the python that has dnspython, not whichever is first on PATH
+            $pythonw  = Join-Path (Split-Path $python) 'pythonw.exe'
+            $act      = New-ScheduledTaskAction -Execute $pythonw -Argument "`"$Script`"" -WorkingDirectory $Here
+            $trig     = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+            $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -RestartCount 3 `
+                            -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew -Hidden `
+                            -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+            Register-ScheduledTask -TaskName $TaskName -Action $act -Trigger $trig -Settings $settings `
+                -User $env:USERNAME -Force | Out-Null
+            Enable-ScheduledTask -TaskName $TaskName | Out-Null
+            if (-not (Get-FilterProcess)) { Start-ScheduledTask -TaskName $TaskName; Start-Sleep -Seconds 2 }
+            if (-not (Get-FilterProcess)) { throw "filter did not start - see $Here\prefer_ipv6_dns.log" }
 
-        $up = Get-Upstreams
-        $servers = @('127.0.0.1') + @($up | Where-Object { $_ -notlike '*:*' }) +
-                   @('::1')       + @($up | Where-Object { $_ -like '*:*' })
-        Set-DnsClientServerAddress -InterfaceAlias $Adapter -ServerAddresses $servers
-    }
-    { $_ -in 'off', 'remove' } {
-        Set-DnsClientServerAddress -InterfaceAlias $Adapter -ResetServerAddresses
-        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-        Get-FilterProcess | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-        if ($Action -eq 'remove') {
-            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-        } else {
-            Disable-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Out-Null
+            $up = Get-Upstreams
+            $servers = @('127.0.0.1') + @($up | Where-Object { $_ -notlike '*:*' }) +
+                       @('::1')       + @($up | Where-Object { $_ -like '*:*' })
+            Set-DnsClientServerAddress -InterfaceAlias $Adapter -ServerAddresses $servers
+            Set-Content $State $Adapter -Encoding UTF8
+        }
+        { $_ -in 'off', 'remove' } {
+            Set-DnsClientServerAddress -InterfaceAlias $Adapter -ResetServerAddresses
+            Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+            Get-FilterProcess | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+            if ($Action -eq 'remove') {
+                Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+                Remove-Item $State -ErrorAction SilentlyContinue
+            } else {
+                Disable-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Out-Null
+            }
         }
     }
+    Clear-DnsClientCache
+} catch {
+    # The UAC window closes as soon as the script ends; keep the error on screen.
+    if ($Elevated) { Write-Host "ERROR: $_" -ForegroundColor Red; Read-Host 'Press Enter to close' | Out-Null }
+    throw
 }
-Clear-DnsClientCache
